@@ -60,6 +60,8 @@ from .custom_views import CustomAgentOutput, CustomAgentStepInfo
 from .custom_massage_manager import CustomMassageManager
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.propagate = True  # Propagate logs to the root logger (Live Logger Output)
 
 
 class CustomAgent(Agent):
@@ -137,7 +139,7 @@ class CustomAgent(Agent):
 
     def update_step_info(self, model_output: CustomAgentOutput, step_info: CustomAgentStepInfo = None):
         """
-        update step info
+        update step info and send it to the UI
         """
         if step_info is None:
             return
@@ -150,6 +152,55 @@ class CustomAgent(Agent):
         completed_contents = model_output.current_state.completed_contents
         if completed_contents and 'None' not in completed_contents:
             step_info.task_progress = completed_contents
+            
+        # Send real-time updates to the UI via the queue
+        # Create a dictionary with step info data
+        step_info_data = {
+            "memory": step_info.memory,
+            "task_progress": step_info.task_progress,
+            "current_step": step_info.step_number,
+            "max_steps": step_info.max_steps
+        }
+        
+        # Print detailed step info for debugging
+        print(f"===== STEP INFO UPDATE =====")
+        print(f"Step: {step_info.step_number}/{step_info.max_steps}")
+        print(f"Memory length: {len(step_info.memory)} chars")
+        print(f"Task progress: {step_info.task_progress}")
+        print(f"========================")
+        
+        # Try to send to the update queue (directly write to file for simplicity)
+        try:
+            # Create a direct file-based communication method as a fallback
+            import os
+            import json
+            
+            # Save step info to a file that webui.py can read
+            step_info_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'step_info.json'))
+            with open(step_info_path, 'w') as f:
+                json.dump(step_info_data, f)
+            print(f"Step info saved to {step_info_path}")
+            
+            # Also try the queue-based approach
+            try:
+                # Use a more robust import approach
+                import sys
+                # Get the root directory of the project
+                root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+                if root_dir not in sys.path:
+                    sys.path.insert(0, root_dir)
+                
+                # Now try to import
+                from webui import update_step_info
+                update_step_info(step_info_data)
+                print("Step info sent via update_step_info function")
+            except ImportError as e:
+                print(f"Warning: Could not import update_step_info: {e}")
+        except Exception as e:
+            # If we can't update, just continue without real-time updates
+            print(f"Warning: Could not update step info: {e}")
+            import traceback
+            traceback.print_exc()
 
     @time_execution_async('--get_next_action')
     async def get_next_action(self, input_messages: list[BaseMessage]) -> AgentOutput:
@@ -173,13 +224,36 @@ class CustomAgent(Agent):
         model_output = None
         result: list[ActionResult] = []
 
+        # Update step info at the beginning of the step to show we're processing
+        if step_info:
+            # Update without changing the step number yet
+            # Create a dictionary with step info data
+            init_step_info_data = {
+                "memory": step_info.memory,
+                "task_progress": f"Processing step {self.n_steps}...",
+                "current_step": self.n_steps,  # Use n_steps directly (current step)
+                "max_steps": step_info.max_steps
+            }
+            
+            # Send initial step info update
+            try:
+                # Save to file for UI to pick up
+                import os
+                import json
+                step_info_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'step_info.json'))
+                with open(step_info_path, 'w') as f:
+                    json.dump(init_step_info_data, f)
+                print(f"Initial step info for step {self.n_steps} saved to file")
+            except Exception as e:
+                print(f"Warning: Could not write initial step info: {e}")
+
         try:
             state = await self.browser_context.get_state(use_vision=self.use_vision)
             self.message_manager.add_state_message(state, self._last_result, step_info)
             input_messages = self.message_manager.get_messages()
             model_output = await self.get_next_action(input_messages)
             self.update_step_info(model_output, step_info)
-            logger.info(f'🧠 All Memory: {step_info.memory}')
+            logger.info(f'🧠 All Memory: {step_info.memory if step_info else "None"}')
             self._save_conversation(input_messages, model_output)
             self.message_manager._remove_last_state_message()  # we dont want the whole state in the chat history
             self.message_manager.add_model_output(model_output)
@@ -197,6 +271,27 @@ class CustomAgent(Agent):
         except Exception as e:
             result = self._handle_step_error(e)
             self._last_result = result
+            
+            # Update step info with error
+            if step_info:
+                error_msg = str(e)
+                step_info.task_progress = f"Error in step {self.n_steps}: {error_msg[:100]}..."
+                
+                # Send error step info update
+                try:
+                    import os
+                    import json
+                    error_step_info_data = {
+                        "memory": step_info.memory,
+                        "task_progress": step_info.task_progress,
+                        "current_step": self.n_steps,
+                        "max_steps": step_info.max_steps
+                    }
+                    step_info_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'step_info.json'))
+                    with open(step_info_path, 'w') as f:
+                        json.dump(error_step_info_data, f)
+                except Exception as e_write:
+                    print(f"Warning: Could not write error step info: {e_write}")
 
         finally:
             if not result:
@@ -229,8 +324,31 @@ class CustomAgent(Agent):
                                             step_number=1,
                                             max_steps=max_steps,
                                             memory='',
-                                            task_progress=''
+                                            task_progress='Starting agent run...'
                                             )
+            
+            # Store step_info as an instance variable so it can be accessed after run() completes
+            self.step_info = step_info
+            
+            # Send initial step info at the start of the run
+            try:
+                import os
+                import json
+                # Create a dictionary with initial step info data
+                init_data = {
+                    "memory": "",
+                    "task_progress": f"Starting agent with task: {self.task[:100]}...",
+                    "current_step": 0,
+                    "max_steps": max_steps
+                }
+                
+                # Save to file for UI to pick up
+                step_info_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'step_info.json'))
+                with open(step_info_path, 'w') as f:
+                    json.dump(init_data, f)
+                print(f"Initial step info at run start saved to file")
+            except Exception as e:
+                print(f"Warning: Could not write initial run step info: {e}")
 
             for step in range(max_steps):
                 if self._too_many_failures():
